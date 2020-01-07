@@ -35,8 +35,8 @@ type Connector struct {
 	driver driver.Driver
 }
 
-//NewSQLite3ReplicaConnector returns a pre-configured driver connection
-func NewSQLite3ReplicaConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, mode int, cacert string) (*Connector, error) {
+//NewConnector returns a pre-configured driver connection
+func NewConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, mode int, cacert string) (*Connector, error) {
 	//setup database specific options
 	opts := url.Values{}
 	//TODO: possibly implement authentication
