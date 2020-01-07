@@ -23,7 +23,7 @@ const (
 //cbor codec handler
 var ch codec.CborHandle
 
-//databaseUpdate represents a single INSERT, UPDATE, or DELETE
+//dbUpdate represents a single INSERT, UPDATE, or DELETE
 type dbUpdate struct {
 	QueryStr string
 	Args     []interface{}
