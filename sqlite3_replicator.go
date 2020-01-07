@@ -2,9 +2,13 @@ package replicator
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
+	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -19,6 +23,7 @@ import (
 const (
 	Primary = iota
 	Secondary
+	Backup
 )
 
 //cbor codec handler
@@ -49,10 +54,10 @@ func NewConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, 
 		opts.Set("_crypto_key", encryptionKey)
 	}
 
-	if mode == Primary {
-		opts.Set("mode", "rw")
-	} else {
+	if mode == Secondary {
 		opts.Set("mode", "ro")
+	} else {
+		opts.Set("mode", "rw")
 	}
 
 	//setup dsn
@@ -139,27 +144,33 @@ func NewConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, 
 			},
 		}
 	} else {
-		var s3Conn *sqlite3.SQLiteConn
-		r.driver = &sqlite3.SQLiteDriver{
-			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-				s3Conn = conn
-				return nil
-			},
+		r.driver = &sqlite3.SQLiteDriver{}
+
+		//adjust options to ensure we have a rw mode
+		opts.Set("mode", "rw")
+		pdsn := url.URL{
+			Path:     dbPath,
+			RawQuery: opts.Encode(),
+		}
+
+		//open a private connection pool
+		rdb, err := sql.Open("sqlite3", pdsn.String())
+		if err != nil {
+			return nil, err
 		}
 
 		sc.Subscribe(channel, func(m *stan.Msg) {
+			//decode the update operation
 			var updateOp dbUpdate
 			if err := codec.NewDecoderBytes(m.Data, &ch).Decode(&updateOp); err != nil {
 				return
 			}
-			args := make([]driver.Value, len(updateOp.Args))
-			for i, v := range updateOp.Args {
-				args[i] = v
-			}
 
-			if _, err := s3Conn.Exec(updateOp.QueryStr, args); err != nil {
+			//update the database
+			if _, err := rdb.Exec(updateOp.QueryStr, updateOp.Args...); err != nil {
 				return
 			}
+
 			m.Ack()
 		}, stan.SetManualAckMode(), stan.MaxInflight(1), stan.DurableName(alias), stan.AckWait(ackWait))
 	}
@@ -181,4 +192,24 @@ func (r *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 // Driver returns the underlying SQLiteDriver
 func (r *Connector) Driver() driver.Driver {
 	return r.driver
+}
+
+func downloadDB(uri, path string) error {
+	//open file
+	out, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	//download data
+	resp, err := http.Get(uri)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	//write data to file
+	_, err = io.Copy(out, resp.Body)
+	return err
 }
