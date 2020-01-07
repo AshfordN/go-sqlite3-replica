@@ -23,14 +23,20 @@ const (
 //cbor codec handler
 var ch codec.CborHandle
 
-//ReplicatorConnector represents a fixed configuration for an SQLite database
-type ReplicatorConnector struct {
+//databaseUpdate represents a single INSERT, UPDATE, or DELETE
+type dbUpdate struct {
+	QueryStr string
+	Args     []interface{}
+}
+
+//Connector represents a fixed configuration for an SQLite database
+type Connector struct {
 	dsn    string
 	driver driver.Driver
 }
 
 //NewSQLite3ReplicaConnector returns a pre-configured driver connection
-func NewSQLite3ReplicaConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, mode int, cacert string) (*ReplicatorConnector, error) {
+func NewSQLite3ReplicaConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, mode int, cacert string) (*Connector, error) {
 	//setup database specific options
 	opts := url.Values{}
 	//TODO: possibly implement authentication
@@ -67,7 +73,7 @@ func NewSQLite3ReplicaConnector(dbPath, encryptionKey, saddr, cluster, alias, ch
 	}
 
 	//contruct replicator
-	r := ReplicatorConnector{
+	r := Connector{
 		dsn: dsn.String(),
 	}
 
@@ -76,7 +82,7 @@ func NewSQLite3ReplicaConnector(dbPath, encryptionKey, saddr, cluster, alias, ch
 		r.driver = &sqlite3.SQLiteDriver{
 			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 				conn.RegisterUpdateHook(func(op int, dbName, tableName string, rowid int64) {
-					var updateOp databaseUpdate
+					var updateOp dbUpdate
 
 					if op == sqlite3.SQLITE_DELETE { //delete operation
 						//define the update operation
@@ -138,7 +144,7 @@ func NewSQLite3ReplicaConnector(dbPath, encryptionKey, saddr, cluster, alias, ch
 		}
 
 		sc.Subscribe(channel, func(m *stan.Msg) {
-			var updateOp databaseUpdate
+			var updateOp dbUpdate
 			if err := codec.NewDecoderBytes(m.Data, &ch).Decode(&updateOp); err != nil {
 				return
 			}
@@ -155,7 +161,7 @@ func NewSQLite3ReplicaConnector(dbPath, encryptionKey, saddr, cluster, alias, ch
 	}
 
 	//clean up
-	runtime.SetFinalizer(&r, func(_r *ReplicatorConnector) {
+	runtime.SetFinalizer(&r, func(_r *Connector) {
 		sc.Close()
 		sc.NatsConn().Close()
 	})
@@ -164,11 +170,11 @@ func NewSQLite3ReplicaConnector(dbPath, encryptionKey, saddr, cluster, alias, ch
 }
 
 //Connect returns a connection to the SQLite database
-func (r *ReplicatorConnector) Connect(ctx context.Context) (driver.Conn, error) {
+func (r *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	return r.driver.Open(r.dsn)
 }
 
 // Driver returns the underlying SQLiteDriver
-func (r *ReplicatorConnector) Driver() driver.Driver {
+func (r *Connector) Driver() driver.Driver {
 	return r.driver
 }
