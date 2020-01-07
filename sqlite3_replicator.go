@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/CovenantSQL/go-sqlite3-encrypt"
 	"github.com/nats-io/nats.go"
@@ -22,6 +23,9 @@ const (
 
 //cbor codec handler
 var ch codec.CborHandle
+
+//ackWait is the time the server should wait before resending a message
+var ackWait = time.Second * 3
 
 //dbUpdate represents a single INSERT, UPDATE, or DELETE
 type dbUpdate struct {
@@ -157,7 +161,7 @@ func NewConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, 
 				return
 			}
 			m.Ack()
-		}, stan.SetManualAckMode(), stan.MaxInflight(1), stan.DurableName(alias))
+		}, stan.SetManualAckMode(), stan.MaxInflight(1), stan.DurableName(alias), stan.AckWait(ackWait))
 	}
 
 	//clean up
