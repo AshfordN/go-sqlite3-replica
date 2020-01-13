@@ -201,7 +201,8 @@ func NewConnector(hostname, path string, user *url.Userinfo, cluster, alias, cha
 
 			//update the database
 			if _, err := rdb.Exec(updateOp.QueryStr, updateOp.Args...); err != nil {
-				errLog.Println(err)
+				r.errLog.Println(err)
+
 				//download the database file
 				if err := downloadDB(&url.URL{
 					Scheme: "https",
@@ -210,6 +211,7 @@ func NewConnector(hostname, path string, user *url.Userinfo, cluster, alias, cha
 					Path:   path,
 				}); err != nil {
 					r.errLog.Println(fmt.Errorf("Failed to download database: %w", err))
+					return
 				}
 
 				m.Ack()
@@ -281,6 +283,7 @@ func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth
 	opts.ID = cluster
 	opts.StoreType = stores.TypeFile
 	opts.FilestoreDir = logDir
+	opts.FileStoreOpts.DoSync = true
 	opts.MaxBytes = maxBytes
 
 	//setup file server options
