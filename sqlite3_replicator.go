@@ -2,19 +2,27 @@ package replicator
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/base64"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/CovenantSQL/go-sqlite3-encrypt"
-	"github.com/nats-io/nats.go"
+
+	natsd "github.com/nats-io/gnatsd/server"
+	stand "github.com/nats-io/nats-streaming-server/server"
+	"github.com/nats-io/nats-streaming-server/stores"
 	"github.com/nats-io/stan.go"
 	"github.com/ugorji/go/codec"
 )
@@ -32,6 +40,12 @@ var ch codec.CborHandle
 //ackWait is the time the server should wait before resending a message
 var ackWait = time.Second * 3
 
+//server ports
+var (
+	natsPort = 4222
+	fsPort   = 6262
+)
+
 //dbUpdate represents a single INSERT, UPDATE, or DELETE
 type dbUpdate struct {
 	QueryStr string
@@ -42,51 +56,65 @@ type dbUpdate struct {
 type Connector struct {
 	dsn    string
 	driver driver.Driver
+	errLog *log.Logger
 }
 
 //NewConnector returns a pre-configured driver connection
-func NewConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, mode int, cacert string) (*Connector, error) {
-	//setup database specific options
-	opts := url.Values{}
-	//TODO: possibly implement authentication
-
-	if encryptionKey != "" {
-		opts.Set("_crypto_key", encryptionKey)
+func NewConnector(hostname, path string, user *url.Userinfo, cluster, alias, channel, encryptionKey string, mode int, errLog *log.Logger) (*Connector, error) {
+	//setup nats url
+	natsURL := url.URL{
+		Scheme: "nats",
+		User:   user,
+		Host:   fmt.Sprintf("%s:%d", hostname, natsPort),
 	}
 
-	if mode == Secondary {
-		opts.Set("mode", "ro")
-	} else {
-		opts.Set("mode", "rw")
-	}
-
-	//setup dsn
-	dsn := url.URL{
-		Path:     dbPath,
-		RawQuery: opts.Encode(),
-	}
-
-	//connection to the core nats server
-	nc, err := nats.Connect(saddr, nats.RootCAs(cacert))
-	if err != nil {
-		return nil, err
-	}
+	//declare streaming connection
+	var sc stan.Conn
 
 	//connect to the streaming server
-	sc, err := stan.Connect(cluster, alias, stan.NatsConn(nc), stan.SetConnectionLostHandler(func(conn stan.Conn, err error) {
+	var err error
+	sc, err = stan.Connect(cluster, alias, stan.NatsURL(natsURL.String()), stan.SetConnectionLostHandler(func(conn stan.Conn, err error) {
 		panic(err)
 	}))
 	if err != nil {
-		nc.Close()
 		return nil, err
 	}
 
-	//contruct replicator
-	r := Connector{
-		dsn: dsn.String(),
+	//setup database options
+	opts := url.Values{}
+	if encryptionKey != "" { //encryption
+		opts.Set("_crypto_key", encryptionKey)
 	}
 
-	//setup the connector based on the mode
+	if mode == Primary { //access mode
+		opts.Set("mode", "rw")
+	} else {
+		opts.Set("mode", "ro")
+	}
+
+	//normalize the path
+	path = filepath.FromSlash(path)
+
+	//setup DSN
+	dsn := url.URL{
+		Scheme:   "file",
+		Opaque:   path,
+		RawQuery: opts.Encode(),
+	}
+
+	//setup logger
+	if errLog == nil {
+		errLog = log.New(log.Writer(), "", log.LstdFlags)
+	}
+	errLog.SetPrefix("node ")
+
+	//contruct replicator
+	r := Connector{
+		dsn:    dsn.String(),
+		errLog: errLog,
+	}
+
+	//setup the driver based on the mode
 	if mode == Primary {
 		r.driver = &sqlite3.SQLiteDriver{
 			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
@@ -102,6 +130,7 @@ func NewConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, 
 						queryStr := fmt.Sprintf("SELECT * FROM %s.%s WHERE ROWID = ?", dbName, tableName)
 						rows, err := conn.Query(queryStr, []driver.Value{rowid})
 						if err != nil {
+							r.errLog.Println(fmt.Errorf("Failed to retrieve updated row: %w", err))
 							return
 						}
 						defer rows.Close()
@@ -109,6 +138,7 @@ func NewConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, 
 						//get values
 						values := make([]driver.Value, len(rows.Columns()))
 						if err := rows.Next(values); err != nil {
+							r.errLog.Println(fmt.Errorf("Failed to read updated row: %w", err))
 							return
 						}
 
@@ -130,12 +160,12 @@ func NewConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, 
 						//encode change as cbor
 						var buf []byte
 						if err := codec.NewEncoderBytes(&buf, &ch).Encode(updateOp); err != nil {
-							panic(err)
+							errLog.Panicln(err)
 						}
 
 						//send change to the log channel
 						if err := sc.Publish(channel, buf); err != nil {
-							panic(err)
+							errLog.Panicln(err)
 						}
 					}
 				})
@@ -149,7 +179,8 @@ func NewConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, 
 		//adjust options to ensure we have a rw mode
 		opts.Set("mode", "rw")
 		pdsn := url.URL{
-			Path:     dbPath,
+			Scheme:   dsn.Scheme,
+			Opaque:   dsn.Opaque,
 			RawQuery: opts.Encode(),
 		}
 
@@ -159,15 +190,29 @@ func NewConnector(dbPath, encryptionKey, saddr, cluster, alias, channel string, 
 			return nil, err
 		}
 
+		//subscribe for update messages
 		sc.Subscribe(channel, func(m *stan.Msg) {
 			//decode the update operation
 			var updateOp dbUpdate
 			if err := codec.NewDecoderBytes(m.Data, &ch).Decode(&updateOp); err != nil {
+				r.errLog.Println(fmt.Errorf("Failed to decode message: %w", err))
 				return
 			}
 
 			//update the database
 			if _, err := rdb.Exec(updateOp.QueryStr, updateOp.Args...); err != nil {
+				errLog.Println(err)
+				//download the database file
+				if err := downloadDB(&url.URL{
+					Scheme: "https",
+					User:   user,
+					Host:   fmt.Sprintf("%s:%d", hostname, fsPort),
+					Path:   path,
+				}); err != nil {
+					r.errLog.Println(fmt.Errorf("Failed to download database: %w", err))
+				}
+
+				m.Ack()
 				return
 			}
 
@@ -194,20 +239,179 @@ func (r *Connector) Driver() driver.Driver {
 	return r.driver
 }
 
-func downloadDB(uri, path string) error {
+//ReplicationService implements the necessary backend servers to facilitate replication
+type ReplicationService struct {
+	natsServer      *natsd.Server
+	streamingServer *stand.StanServer
+	fileServer      *http.Server
+	errLog          *log.Logger
+	auth            func(username, password string) bool
+	internalToken   string
+}
+
+//StartReplicationService configures and runs the server instances that facilitate the replication
+func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth func(string, string) bool,
+	encryptionkey []byte, cert, key string, errLog *log.Logger) (*ReplicationService, error) {
+	//setup logger
+	if errLog == nil {
+		errLog = log.New(log.Writer(), "", log.LstdFlags)
+	}
+	errLog.SetPrefix("server ")
+
+	//get random bytes
+	buf := make([]byte, 128)
+	if _, err := rand.Read(buf); err != nil {
+		return nil, err
+	}
+
+	//define replication service
+	s := ReplicationService{
+		auth:          auth,
+		internalToken: base64.StdEncoding.EncodeToString(buf),
+	}
+
+	//get default options
+	opts := stand.GetDefaultOptions()
+	nopts := &natsd.Options{}
+
+	//setup server options
+	nopts.Port = natsPort
+	nopts.MaxPayload = (1024 * 1024 * 2) //2MB payload size
+	nopts.CustomClientAuthentication = &s
+	opts.ID = cluster
+	opts.StoreType = stores.TypeFile
+	opts.FilestoreDir = logDir
+	opts.MaxBytes = maxBytes
+
+	//setup file server options
+	s.fileServer = &http.Server{
+		Addr:    fmt.Sprintf(":%d", fsPort),
+		Handler: s.authHandler(http.FileServer(http.Dir(fsDir))),
+	}
+
+	//determine if we should enable storage encryption
+	if encryptionkey != nil {
+		opts.Encrypt = true
+		opts.EncryptionCipher = "AES"
+		opts.EncryptionKey = encryptionkey
+	}
+
+	//determine if we should enable TLS
+	if cert != "" && key != "" {
+		//nats server TLS
+		nopts.TLS = true
+		nopts.TLSCert = cert
+		nopts.TLSKey = key
+
+		//start file server
+		go func() {
+			errLog.Panicln(s.fileServer.ListenAndServeTLS(cert, key))
+		}()
+	} else {
+		//start file server
+		go func() {
+			errLog.Panicln(s.fileServer.ListenAndServe())
+		}()
+	}
+
+	//start core server
+	var err error
+	s.natsServer, err = natsd.NewServer(nopts)
+	if err != nil {
+		return nil, err
+	}
+	go s.natsServer.Start()
+
+	if ok := s.natsServer.ReadyForConnections(time.Second * 5); !ok {
+		return nil, fmt.Errorf("Could not start core nats server")
+	}
+
+	//start streaming server
+	snopts := stand.NewNATSOptions()
+	snopts.Authorization = s.internalToken
+	opts.NATSServerURL = s.natsServer.ClientURL()
+	if s.streamingServer, err = stand.RunServerWithOpts(opts, snopts); err != nil {
+		return nil, err
+	}
+
+	return &s, nil
+}
+
+//authHandler checks the authentication information for the file server before serving a request on another handler
+func (s *ReplicationService) authHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		//get user info
+		usr, pwd, ok := req.BasicAuth()
+		if !ok {
+			http.Error(res, "Authentication Required", http.StatusUnauthorized)
+			return
+		}
+
+		//check auth
+		if s.auth != nil {
+			if ok := s.auth(usr, pwd); !ok {
+				http.Error(res, "Not Authorized", http.StatusUnauthorized)
+				return
+			}
+		}
+
+		//hand over the request
+		next.ServeHTTP(res, req)
+	})
+}
+
+//Check allows the replication server to acts as a custom nats authenticator
+func (s *ReplicationService) Check(c natsd.ClientAuthentication) bool {
+	//get client details
+	clientOpts := c.GetOpts()
+
+	//make exception for the streaming server
+	if clientOpts.Authorization == s.internalToken {
+		return true
+	}
+
+	//authenticate user
+	if s.auth != nil {
+		return s.auth(clientOpts.Username, clientOpts.Password)
+	}
+
+	return true
+}
+
+//Shutdown shuts down the active server
+func (s *ReplicationService) Shutdown() error {
+	s.natsServer.Shutdown()
+	s.streamingServer.Shutdown()
+	return s.fileServer.Close()
+}
+
+//downloadDB retrieves the database file from the main server
+func downloadDB(uri *url.URL) error {
 	//open file
-	out, err := os.Create(path)
+	out, err := os.Create(uri.Path)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 
+	//adjust the path
+	parts := strings.SplitN(uri.Path, "/", 2)
+	if len(parts) == 1 {
+		uri.Path = parts[0]
+	} else {
+		uri.Path = parts[1]
+	}
+
 	//download data
-	resp, err := http.Get(uri)
+	resp, err := http.Get(uri.String())
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respStr, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf(string(respStr))
+	}
 
 	//write data to file
 	_, err = io.Copy(out, resp.Body)
