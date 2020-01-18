@@ -1,15 +1,16 @@
 package replicator
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/base64"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +18,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/Elbandi/gsync"
 
 	"github.com/CovenantSQL/go-sqlite3-encrypt"
 
@@ -57,10 +60,14 @@ type Connector struct {
 	dsn    string
 	driver driver.Driver
 	errLog *log.Logger
+	dir    string
+	path   string
+	user   *url.Userinfo
+	fsHost string
 }
 
 //NewConnector returns a pre-configured driver connection
-func NewConnector(hostname, path string, user *url.Userinfo, cluster, alias, channel, encryptionKey string, mode int, errLog *log.Logger) (*Connector, error) {
+func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, alias, channel, encryptionKey string, mode int, errLog *log.Logger) (*Connector, error) {
 	//setup nats url
 	natsURL := url.URL{
 		Scheme: "nats",
@@ -93,7 +100,7 @@ func NewConnector(hostname, path string, user *url.Userinfo, cluster, alias, cha
 	}
 
 	//normalize the path
-	path = filepath.FromSlash(path)
+	path := filepath.Join(filepath.FromSlash(dir), dbPath)
 
 	//setup DSN
 	dsn := url.URL{
@@ -109,14 +116,18 @@ func NewConnector(hostname, path string, user *url.Userinfo, cluster, alias, cha
 	errLog.SetPrefix("node ")
 
 	//contruct replicator
-	r := Connector{
+	c := Connector{
 		dsn:    dsn.String(),
 		errLog: errLog,
+		dir:    dir,
+		path:   dbPath,
+		user:   user,
+		fsHost: fmt.Sprintf("%s:%d", hostname, fsPort),
 	}
 
 	//setup the driver based on the mode
 	if mode == Primary {
-		r.driver = &sqlite3.SQLiteDriver{
+		c.driver = &sqlite3.SQLiteDriver{
 			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 				conn.RegisterUpdateHook(func(op int, dbName, tableName string, rowid int64) {
 					var updateOp dbUpdate
@@ -130,7 +141,7 @@ func NewConnector(hostname, path string, user *url.Userinfo, cluster, alias, cha
 						queryStr := fmt.Sprintf("SELECT * FROM %s.%s WHERE ROWID = ?", dbName, tableName)
 						rows, err := conn.Query(queryStr, []driver.Value{rowid})
 						if err != nil {
-							r.errLog.Println(fmt.Errorf("Failed to retrieve updated row: %w", err))
+							c.errLog.Println(fmt.Errorf("Failed to retrieve updated row: %w", err))
 							return
 						}
 						defer rows.Close()
@@ -138,7 +149,7 @@ func NewConnector(hostname, path string, user *url.Userinfo, cluster, alias, cha
 						//get values
 						values := make([]driver.Value, len(rows.Columns()))
 						if err := rows.Next(values); err != nil {
-							r.errLog.Println(fmt.Errorf("Failed to read updated row: %w", err))
+							c.errLog.Println(fmt.Errorf("Failed to read updated row: %w", err))
 							return
 						}
 
@@ -174,7 +185,7 @@ func NewConnector(hostname, path string, user *url.Userinfo, cluster, alias, cha
 			},
 		}
 	} else {
-		r.driver = &sqlite3.SQLiteDriver{}
+		c.driver = &sqlite3.SQLiteDriver{}
 
 		//adjust options to ensure we have a rw mode
 		opts.Set("mode", "rw")
@@ -195,22 +206,17 @@ func NewConnector(hostname, path string, user *url.Userinfo, cluster, alias, cha
 			//decode the update operation
 			var updateOp dbUpdate
 			if err := codec.NewDecoderBytes(m.Data, &ch).Decode(&updateOp); err != nil {
-				r.errLog.Println(fmt.Errorf("Failed to decode message: %w", err))
+				c.errLog.Println(fmt.Errorf("Failed to decode message: %w", err))
 				return
 			}
 
 			//update the database
 			if _, err := rdb.Exec(updateOp.QueryStr, updateOp.Args...); err != nil {
-				r.errLog.Println(err)
+				c.errLog.Println(err)
 
 				//download the database file
-				if err := downloadDB(&url.URL{
-					Scheme: "https",
-					User:   user,
-					Host:   fmt.Sprintf("%s:%d", hostname, fsPort),
-					Path:   path,
-				}); err != nil {
-					r.errLog.Println(fmt.Errorf("Failed to download database: %w", err))
+				if err := c.syncDB(); err != nil {
+					c.errLog.Println(fmt.Errorf("Failed to download database: %w", err))
 					return
 				}
 
@@ -223,22 +229,148 @@ func NewConnector(hostname, path string, user *url.Userinfo, cluster, alias, cha
 	}
 
 	//clean up
-	runtime.SetFinalizer(&r, func(_r *Connector) {
+	runtime.SetFinalizer(&c, func(_c *Connector) {
 		sc.Close()
 		sc.NatsConn().Close()
 	})
 
-	return &r, nil
+	return &c, nil
+}
+
+//syncDB retrieves the database file from the main server
+func (c *Connector) syncDB() error {
+	ctx := context.Background()
+
+	//define file path
+	path := filepath.Join(filepath.FromSlash(c.dir), c.path)
+
+	//open the basis file
+	basis, err := os.Open(path)
+	if err != nil {
+		c.errLog.Println(err)
+	}
+	defer basis.Close()
+
+	//compute the signature
+	sigs, err := gsync.Signatures(ctx, basis, nil)
+	if err != nil {
+		return err
+	}
+
+	//stream signature
+	buf := &bytes.Buffer{}
+	body := multipart.NewWriter(buf)
+	go func() {
+		defer body.Close()
+		for sig := range sigs {
+			//create new part
+			w, err := body.CreatePart(nil)
+			if err != nil {
+				c.errLog.Println(err)
+				return
+			}
+
+			//encode the signature
+			if err := codec.NewEncoder(w, &ch).Encode(sig); err != nil {
+				c.errLog.Println(err)
+				return
+			}
+		}
+	}()
+
+	//construct URI
+	uri := &url.URL{
+		Scheme: "https",
+		User:   c.user,
+		Host:   c.fsHost,
+		Path:   c.path,
+	}
+
+	//construct request
+	req, err := http.NewRequest(http.MethodGet, uri.String(), buf)
+	if err != nil {
+		return err
+	}
+
+	//set content-type
+	req.Header.Set("Content-Type", fmt.Sprintf("multipart/byterange; boundary=%s", body.Boundary()))
+
+	//open the destination file
+	out, err := os.Create(path + ".tmp")
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	//retrieve the delta
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respStr, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf(string(respStr))
+	}
+
+	//get boudary
+	_contentType := strings.SplitN(resp.Header.Get("Content-Type"), "=", 2)
+	if len(_contentType) < 2 {
+		return fmt.Errorf("invalid content-type")
+	}
+	boundary := _contentType[1]
+
+	//stream the response
+	ops := make(chan gsync.BlockOperation)
+	r := multipart.NewReader(resp.Body, boundary)
+
+	go func() {
+		defer close(ops)
+		for {
+			//get next part
+			part, err := r.NextPart()
+			if err != nil {
+				break
+			}
+
+			//decode operation
+			var op gsync.BlockOperation
+			if err := codec.NewDecoder(part, &ch).Decode(&op); err != nil {
+				return
+			}
+
+			log.Printf("updated block: %d", op.Index)
+
+			//channel operation
+			ops <- op
+		}
+	}()
+
+	//apply delta
+	if err := gsync.Apply(ctx, out, basis, ops); err != nil {
+		return err
+	}
+
+	//remove the old basis file and replace it with the newly synchronized version
+	if err := os.Remove(path); err != nil {
+		c.errLog.Println(err)
+	}
+
+	if err := os.Rename(path+".tmp", path); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 //Connect returns a connection to the SQLite database
-func (r *Connector) Connect(ctx context.Context) (driver.Conn, error) {
-	return r.driver.Open(r.dsn)
+func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
+	return c.driver.Open(c.dsn)
 }
 
 // Driver returns the underlying SQLiteDriver
-func (r *Connector) Driver() driver.Driver {
-	return r.driver
+func (c *Connector) Driver() driver.Driver {
+	return c.driver
 }
 
 //ReplicationService implements the necessary backend servers to facilitate replication
@@ -288,8 +420,77 @@ func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth
 
 	//setup file server options
 	s.fileServer = &http.Server{
-		Addr:    fmt.Sprintf(":%d", fsPort),
-		Handler: s.authHandler(http.FileServer(http.Dir(fsDir))),
+		Addr: fmt.Sprintf(":%d", fsPort),
+		Handler: s.authHandler(func(res http.ResponseWriter, req *http.Request) {
+			//get boudary
+			_contentType := strings.SplitN(req.Header.Get("Content-Type"), "=", 2)
+			if len(_contentType) < 2 {
+				http.Error(res, "", http.StatusNotAcceptable)
+				return
+			}
+			boundary := _contentType[1]
+
+			//stream signature
+			r := multipart.NewReader(req.Body, boundary)
+			sigs := make(chan gsync.BlockSignature)
+
+			go func() {
+				defer close(sigs)
+				for {
+					//get next part
+					part, err := r.NextPart()
+					if err != nil {
+						break
+					}
+
+					//decode signature
+					var sig gsync.BlockSignature
+					if err := codec.NewDecoder(part, &ch).Decode(&sig); err != nil {
+						s.errLog.Println(err)
+						return
+					}
+
+					//channel signature
+					sigs <- sig
+				}
+			}()
+
+			//build lookup table
+			lookupTable, err := gsync.LookUpTable(req.Context(), sigs)
+
+			//open source file
+			in, err := os.Open(filepath.Join(fsDir, req.URL.Path))
+			if err != nil {
+				http.Error(res, "error opening source file", http.StatusInternalServerError)
+				return
+			}
+
+			//compute difference
+			ops, err := gsync.Sync(req.Context(), in, nil, nil, lookupTable)
+			if err != nil {
+				res.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			//stream response
+			resp := multipart.NewWriter(res)
+			res.Header().Set("Content-Type", fmt.Sprintf("multipart/byterange; boundary=%s", resp.Boundary()))
+			for op := range ops {
+				//create new part
+				w, err := resp.CreatePart(nil)
+				if err != nil {
+					http.Error(res, "error structuring response", http.StatusInternalServerError)
+					return
+				}
+
+				//encode data
+				if err := codec.NewEncoder(w, &ch).Encode(op); err != nil {
+					http.Error(res, "error encoding response", http.StatusInternalServerError)
+					return
+				}
+			}
+			resp.Close()
+		}),
 	}
 
 	//determine if we should enable storage encryption
@@ -341,7 +542,7 @@ func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth
 }
 
 //authHandler checks the authentication information for the file server before serving a request on another handler
-func (s *ReplicationService) authHandler(next http.Handler) http.Handler {
+func (s *ReplicationService) authHandler(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
 		//get user info
 		usr, pwd, ok := req.BasicAuth()
@@ -388,35 +589,7 @@ func (s *ReplicationService) Shutdown() error {
 	return s.fileServer.Close()
 }
 
-//downloadDB retrieves the database file from the main server
-func downloadDB(uri *url.URL) error {
-	//open file
-	out, err := os.Create(uri.Path)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	//adjust the path
-	parts := strings.SplitN(uri.Path, "/", 2)
-	if len(parts) == 1 {
-		uri.Path = parts[0]
-	} else {
-		uri.Path = parts[1]
-	}
-
-	//download data
-	resp, err := http.Get(uri.String())
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		respStr, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf(string(respStr))
-	}
-
-	//write data to file
-	_, err = io.Copy(out, resp.Body)
-	return err
+func init() {
+	ch.WriterBufferSize = 1 * 1024
+	ch.ReaderBufferSize = 1 * 1024
 }
