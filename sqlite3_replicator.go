@@ -590,6 +590,6 @@ func (s *ReplicationService) Shutdown() error {
 }
 
 func init() {
-	ch.WriterBufferSize = 1 * 1024
-	ch.ReaderBufferSize = 1 * 1024
+	ch.WriterBufferSize = 4 * 1024
+	ch.ReaderBufferSize = 4 * 1024
 }
