@@ -1,13 +1,13 @@
 package replicator
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"mime/multipart"
@@ -66,6 +66,11 @@ type Connector struct {
 	fsHost string
 }
 
+//Conn represents a wrapped sql connection that exposes the ability to disconnect from the underlying replication
+type Conn struct {
+	sql.Conn
+}
+
 //NewConnector returns a pre-configured driver connection
 func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, alias, channel, encryptionKey string, mode int, errLog *log.Logger) (*Connector, error) {
 	//setup nats url
@@ -75,12 +80,8 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 		Host:   fmt.Sprintf("%s:%d", hostname, natsPort),
 	}
 
-	//declare streaming connection
-	var sc stan.Conn
-
 	//connect to the streaming server
-	var err error
-	sc, err = stan.Connect(cluster, alias, stan.NatsURL(natsURL.String()), stan.SetConnectionLostHandler(func(conn stan.Conn, err error) {
+	sc, err := stan.Connect(cluster, alias, stan.NatsURL(natsURL.String()), stan.SetConnectionLostHandler(func(conn stan.Conn, err error) {
 		panic(err)
 	}))
 	if err != nil {
@@ -102,7 +103,7 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 	//normalize the path
 	path := filepath.Join(filepath.FromSlash(dir), dbPath)
 
-	//setup DSN
+	//construct DSN
 	dsn := url.URL{
 		Scheme:   "file",
 		Opaque:   path,
@@ -115,7 +116,7 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 	}
 	errLog.SetPrefix("node ")
 
-	//contruct replicator
+	//contruct the connector
 	c := Connector{
 		dsn:    dsn.String(),
 		errLog: errLog,
@@ -137,7 +138,7 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 						updateOp.QueryStr = fmt.Sprintf("DELETE FROM %s.%s WHERE ROWID = ?", dbName, tableName)
 						updateOp.Args = []interface{}{rowid}
 					} else if op == sqlite3.SQLITE_INSERT || op == sqlite3.SQLITE_UPDATE {
-						//get updated row
+						//get affected row
 						queryStr := fmt.Sprintf("SELECT * FROM %s.%s WHERE ROWID = ?", dbName, tableName)
 						rows, err := conn.Query(queryStr, []driver.Value{rowid})
 						if err != nil {
@@ -167,17 +168,17 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 								strings.Join(rows.Columns(), ","), strings.Repeat("?,", len(rows.Columns())-1))
 							updateOp.Args = append(updateOp.Args, rowid)
 						}
+					}
 
-						//encode change as cbor
-						var buf []byte
-						if err := codec.NewEncoderBytes(&buf, &ch).Encode(updateOp); err != nil {
-							errLog.Panicln(err)
-						}
+					//encode change as cbor
+					var buf []byte
+					if err := codec.NewEncoderBytes(&buf, &ch).Encode(updateOp); err != nil {
+						errLog.Panicln(err)
+					}
 
-						//send change to the log channel
-						if err := sc.Publish(channel, buf); err != nil {
-							errLog.Panicln(err)
-						}
+					//send change to the log channel
+					if err := sc.Publish(channel, buf); err != nil {
+						errLog.Panicln(err)
 					}
 				})
 
@@ -202,7 +203,7 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 		}
 
 		//subscribe for update messages
-		sc.Subscribe(channel, func(m *stan.Msg) {
+		_, err = sc.Subscribe(channel, func(m *stan.Msg) {
 			//decode the update operation
 			var updateOp dbUpdate
 			if err := codec.NewDecoderBytes(m.Data, &ch).Decode(&updateOp); err != nil {
@@ -211,7 +212,7 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 			}
 
 			//update the database
-			if _, err := rdb.Exec(updateOp.QueryStr, updateOp.Args...); err != nil {
+			if result, err := rdb.Exec(updateOp.QueryStr, updateOp.Args...); err != nil {
 				c.errLog.Println(err)
 
 				//download the database file
@@ -219,13 +220,26 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 					c.errLog.Println(fmt.Errorf("Failed to download database: %w", err))
 					return
 				}
-
-				m.Ack()
-				return
+			} else {
+				if n, err := result.RowsAffected(); err != nil {
+					c.errLog.Println(err)
+				} else if n == 0 { //database is corrupt
+					//download the database file
+					if err := c.syncDB(); err != nil {
+						c.errLog.Println(fmt.Errorf("Failed to download database: %w", err))
+						return
+					}
+				}
 			}
 
-			m.Ack()
+			//acknowledge message
+			if err := m.Ack(); err != nil {
+				c.errLog.Println(fmt.Errorf("Failed to acknowledge message: %w", err))
+			}
 		}, stan.SetManualAckMode(), stan.MaxInflight(1), stan.DurableName(alias), stan.AckWait(ackWait))
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	//clean up
@@ -239,17 +253,19 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 
 //syncDB retrieves the database file from the main server
 func (c *Connector) syncDB() error {
-	ctx := context.Background()
+	ctx := context.TODO()
 
-	//define file path
+	//define file paths
 	path := filepath.Join(filepath.FromSlash(c.dir), c.path)
+	tmpPath := path + ".tmp"
 
 	//open the basis file
 	basis, err := os.Open(path)
 	if err != nil {
 		c.errLog.Println(err)
+	} else {
+		defer basis.Close()
 	}
-	defer basis.Close()
 
 	//compute the signature
 	sigs, err := gsync.Signatures(ctx, basis, nil)
@@ -258,8 +274,8 @@ func (c *Connector) syncDB() error {
 	}
 
 	//stream signature
-	buf := &bytes.Buffer{}
-	body := multipart.NewWriter(buf)
+	pipeOut, pipeIn := io.Pipe()
+	body := multipart.NewWriter(pipeIn)
 	go func() {
 		defer body.Close()
 		for sig := range sigs {
@@ -287,16 +303,16 @@ func (c *Connector) syncDB() error {
 	}
 
 	//construct request
-	req, err := http.NewRequest(http.MethodGet, uri.String(), buf)
+	req, err := http.NewRequest(http.MethodPost, uri.String(), pipeOut)
 	if err != nil {
 		return err
 	}
 
 	//set content-type
-	req.Header.Set("Content-Type", fmt.Sprintf("multipart/byterange; boundary=%s", body.Boundary()))
+	req.Header.Set("Content-Type", body.FormDataContentType())
 
 	//open the destination file
-	out, err := os.Create(path + ".tmp")
+	out, err := os.Create(tmpPath)
 	if err != nil {
 		return err
 	}
@@ -339,7 +355,12 @@ func (c *Connector) syncDB() error {
 				return
 			}
 
-			log.Printf("updated block: %d", op.Index)
+			//check for operation error
+			if op.Error != nil {
+				c.errLog.Printf("operation error: %w", op.Error)
+			}
+
+			c.errLog.Printf("updated block: %d", op.Index)
 
 			//channel operation
 			ops <- op
@@ -356,7 +377,7 @@ func (c *Connector) syncDB() error {
 		c.errLog.Println(err)
 	}
 
-	if err := os.Rename(path+".tmp", path); err != nil {
+	if err := os.Rename(tmpPath, path); err != nil {
 		return err
 	}
 
@@ -402,6 +423,7 @@ func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth
 	s := ReplicationService{
 		auth:          auth,
 		internalToken: base64.StdEncoding.EncodeToString(buf),
+		errLog:        errLog,
 	}
 
 	//get default options
@@ -450,6 +472,11 @@ func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth
 						return
 					}
 
+					//check signature for errors
+					if sig.Error != nil {
+						s.errLog.Printf("signature error: %w", sig.Error)
+					}
+
 					//channel signature
 					sigs <- sig
 				}
@@ -457,6 +484,9 @@ func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth
 
 			//build lookup table
 			lookupTable, err := gsync.LookUpTable(req.Context(), sigs)
+			if err != nil {
+				http.Error(res, "error building lookup table", http.StatusInternalServerError)
+			}
 
 			//open source file
 			in, err := os.Open(filepath.Join(fsDir, req.URL.Path))
@@ -474,18 +504,16 @@ func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth
 
 			//stream response
 			resp := multipart.NewWriter(res)
-			res.Header().Set("Content-Type", fmt.Sprintf("multipart/byterange; boundary=%s", resp.Boundary()))
+			res.Header().Set("Content-Type", resp.FormDataContentType())
 			for op := range ops {
 				//create new part
 				w, err := resp.CreatePart(nil)
 				if err != nil {
-					http.Error(res, "error structuring response", http.StatusInternalServerError)
 					return
 				}
 
 				//encode data
 				if err := codec.NewEncoder(w, &ch).Encode(op); err != nil {
-					http.Error(res, "error encoding response", http.StatusInternalServerError)
 					return
 				}
 			}
