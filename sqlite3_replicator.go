@@ -19,6 +19,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nats-io/nats.go"
+
 	"github.com/Elbandi/gsync"
 
 	"github.com/CovenantSQL/go-sqlite3-encrypt"
@@ -60,6 +62,7 @@ type Connector struct {
 	dsn    string
 	driver driver.Driver
 	errLog *log.Logger
+	sc     stan.Conn
 	dir    string
 	path   string
 	user   *url.Userinfo
@@ -68,7 +71,13 @@ type Connector struct {
 
 //Conn represents a wrapped sql connection that exposes the ability to disconnect from the underlying replication
 type Conn struct {
-	sql.Conn
+	driver.Conn
+	sc stan.Conn
+}
+
+//Stop closes the underlying remote connection
+func (c Conn) Stop() error {
+	return c.sc.Close()
 }
 
 //NewConnector returns a pre-configured driver connection
@@ -120,6 +129,7 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 	c := Connector{
 		dsn:    dsn.String(),
 		errLog: errLog,
+		sc:     sc,
 		dir:    dir,
 		path:   dbPath,
 		user:   user,
@@ -238,14 +248,20 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 			}
 		}, stan.SetManualAckMode(), stan.MaxInflight(1), stan.DurableName(alias), stan.AckWait(ackWait))
 		if err != nil {
+			rdb.Close()
 			return nil, err
 		}
+
+		//set the close handler for the underlying nats connection
+		sc.NatsConn().SetClosedHandler(func(c *nats.Conn) {
+			//close the private database connection pool
+			rdb.Close()
+		})
 	}
 
 	//clean up
 	runtime.SetFinalizer(&c, func(_c *Connector) {
 		sc.Close()
-		sc.NatsConn().Close()
 	})
 
 	return &c, nil
@@ -260,7 +276,7 @@ func (c *Connector) syncDB() error {
 	tmpPath := path + ".tmp"
 
 	//open the basis file
-	basis, err := os.Open(path)
+	basis, err := os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0666)
 	if err != nil {
 		c.errLog.Println(err)
 	} else {
@@ -360,8 +376,6 @@ func (c *Connector) syncDB() error {
 				c.errLog.Printf("operation error: %w", op.Error)
 			}
 
-			c.errLog.Printf("updated block: %d", op.Index)
-
 			//channel operation
 			ops <- op
 		}
@@ -386,7 +400,12 @@ func (c *Connector) syncDB() error {
 
 //Connect returns a connection to the SQLite database
 func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
-	return c.driver.Open(c.dsn)
+	_conn, err := c.driver.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	return Conn{Conn: _conn, sc: c.sc}, nil
 }
 
 // Driver returns the underlying SQLiteDriver
