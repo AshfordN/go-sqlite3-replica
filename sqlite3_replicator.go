@@ -3,6 +3,7 @@ package replicator
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/base64"
@@ -45,28 +46,10 @@ var ch codec.CborHandle
 //ackWait is the time the server should wait before resending a message
 var ackWait = time.Second * 3
 
-//server ports
-var (
-	natsPort = 4222
-	fsPort   = 6262
-)
-
 //dbUpdate represents a single INSERT, UPDATE, or DELETE
 type dbUpdate struct {
 	QueryStr string
 	Args     []interface{}
-}
-
-//Connector represents a fixed configuration for an SQLite database
-type Connector struct {
-	dsn    string
-	driver driver.Driver
-	errLog *log.Logger
-	sc     stan.Conn
-	dir    string
-	path   string
-	user   *url.Userinfo
-	fsHost string
 }
 
 //Conn represents a wrapped sql connection that exposes the ability to disconnect from the underlying replication
@@ -80,17 +63,54 @@ func (c Conn) Stop() error {
 	return c.sc.Close()
 }
 
+type ConnectorConfig struct {
+	Hostname      string
+	NatsPort      int
+	FsPort        int
+	Dir           string
+	DBPath        string
+	User          *url.Userinfo
+	Cluster       string
+	Alias         string
+	Channel       string
+	EncryptionKey string
+	Mode          int
+	ServerName    string
+	ErrLog        *log.Logger
+}
+
+func DefaultConnectorConfig() *ConnectorConfig {
+	return &ConnectorConfig{
+		Hostname: "127.0.0.1",
+		NatsPort: 4242,
+		FsPort:   6262,
+	}
+}
+
+//Connector represents a fixed configuration for an SQLite database
+type Connector struct {
+	dsn        string
+	driver     driver.Driver
+	errLog     *log.Logger
+	sc         stan.Conn
+	dir        string
+	path       string
+	user       *url.Userinfo
+	fsHost     string
+	serverName string
+}
+
 //NewConnector returns a pre-configured driver connection
-func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, alias, channel, encryptionKey string, mode int, errLog *log.Logger) (*Connector, error) {
+func NewConnector(config *ConnectorConfig) (*Connector, error) {
 	//setup nats url
 	natsURL := url.URL{
 		Scheme: "nats",
-		User:   user,
-		Host:   fmt.Sprintf("%s:%d", hostname, natsPort),
+		User:   config.User,
+		Host:   fmt.Sprintf("%s:%d", config.Hostname, config.NatsPort),
 	}
 
 	//connect to the streaming server
-	sc, err := stan.Connect(cluster, alias, stan.NatsURL(natsURL.String()), stan.SetConnectionLostHandler(func(conn stan.Conn, err error) {
+	sc, err := stan.Connect(config.Cluster, config.Alias, stan.NatsURL(natsURL.String()), stan.SetConnectionLostHandler(func(conn stan.Conn, err error) {
 		panic(err)
 	}))
 	if err != nil {
@@ -99,18 +119,18 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 
 	//setup database options
 	opts := url.Values{}
-	if encryptionKey != "" { //encryption
-		opts.Set("_crypto_key", encryptionKey)
+	if config.EncryptionKey != "" { //encryption
+		opts.Set("_crypto_key", config.EncryptionKey)
 	}
 
-	if mode == Primary { //access mode
+	if config.Mode == Primary { //access mode
 		opts.Set("mode", "rw")
 	} else {
 		opts.Set("mode", "ro")
 	}
 
 	//normalize the path
-	path := filepath.Join(filepath.FromSlash(dir), dbPath)
+	path := filepath.Join(filepath.FromSlash(config.Dir), config.DBPath)
 
 	//construct DSN
 	dsn := url.URL{
@@ -120,24 +140,25 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 	}
 
 	//setup logger
-	if errLog == nil {
-		errLog = log.New(log.Writer(), "", log.LstdFlags)
+	if config.ErrLog == nil {
+		config.ErrLog = log.New(log.Writer(), "", log.LstdFlags)
 	}
-	errLog.SetPrefix("node ")
+	config.ErrLog.SetPrefix("node ")
 
 	//contruct the connector
 	c := Connector{
-		dsn:    dsn.String(),
-		errLog: errLog,
-		sc:     sc,
-		dir:    dir,
-		path:   dbPath,
-		user:   user,
-		fsHost: fmt.Sprintf("%s:%d", hostname, fsPort),
+		dsn:        dsn.String(),
+		errLog:     config.ErrLog,
+		sc:         sc,
+		dir:        config.Dir,
+		path:       config.DBPath,
+		user:       config.User,
+		fsHost:     fmt.Sprintf("%s:%d", config.Hostname, config.FsPort),
+		serverName: config.ServerName,
 	}
 
 	//setup the driver based on the mode
-	if mode == Primary {
+	if config.Mode == Primary {
 		c.driver = &sqlite3.SQLiteDriver{
 			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 				conn.RegisterUpdateHook(func(op int, dbName, tableName string, rowid int64) {
@@ -183,12 +204,12 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 					//encode change as cbor
 					var buf []byte
 					if err := codec.NewEncoderBytes(&buf, &ch).Encode(updateOp); err != nil {
-						errLog.Panicln(err)
+						c.errLog.Panicln(err)
 					}
 
 					//send change to the log channel
-					if err := sc.Publish(channel, buf); err != nil {
-						errLog.Panicln(err)
+					if err := sc.Publish(config.Channel, buf); err != nil {
+						c.errLog.Panicln(err)
 					}
 				})
 
@@ -213,7 +234,7 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 		}
 
 		//subscribe for update messages
-		_, err = sc.Subscribe(channel, func(m *stan.Msg) {
+		_, err = sc.Subscribe(config.Channel, func(m *stan.Msg) {
 			//decode the update operation
 			var updateOp dbUpdate
 			if err := codec.NewDecoderBytes(m.Data, &ch).Decode(&updateOp); err != nil {
@@ -223,7 +244,7 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 
 			//update the database
 			if result, err := rdb.Exec(updateOp.QueryStr, updateOp.Args...); err != nil {
-				c.errLog.Println(err)
+				c.errLog.Println(fmt.Errorf("Failed to update database: %w", err))
 
 				//download the database file
 				if err := c.syncDB(); err != nil {
@@ -246,7 +267,7 @@ func NewConnector(hostname, dir, dbPath string, user *url.Userinfo, cluster, ali
 			if err := m.Ack(); err != nil {
 				c.errLog.Println(fmt.Errorf("Failed to acknowledge message: %w", err))
 			}
-		}, stan.SetManualAckMode(), stan.MaxInflight(1), stan.DurableName(alias), stan.AckWait(ackWait))
+		}, stan.SetManualAckMode(), stan.MaxInflight(1), stan.DurableName(config.Alias), stan.AckWait(ackWait))
 		if err != nil {
 			rdb.Close()
 			return nil, err
@@ -293,6 +314,7 @@ func (c *Connector) syncDB() error {
 	pipeOut, pipeIn := io.Pipe()
 	body := multipart.NewWriter(pipeIn)
 	go func() {
+		defer pipeIn.Close()
 		defer body.Close()
 		for sig := range sigs {
 			//create new part
@@ -334,8 +356,18 @@ func (c *Connector) syncDB() error {
 	}
 	defer out.Close()
 
+	//define the client
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName: c.serverName,
+			},
+		},
+		Timeout: ackWait,
+	}
+
 	//retrieve the delta
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -413,6 +445,34 @@ func (c *Connector) Driver() driver.Driver {
 	return c.driver
 }
 
+//ServiceConfig represents the configuration for a replication service
+type ServiceConfig struct {
+	NatsPort         int
+	FsPort           int
+	Auth             func(string, string) bool
+	Cluster          string
+	LogDir           string
+	MaxBytes         int64
+	FsDir            string
+	LogEncryptionKey []byte
+	Certificate      string
+	Key              string
+	ErrLog           *log.Logger
+}
+
+//DefaultServiceConfig returns the default configuration settings for a server
+//NB: the returned configuration does not work out of the box, the certificate and key must be set
+func DefaultServiceConfig() *ServiceConfig {
+	return &ServiceConfig{
+		NatsPort: 4242,
+		FsPort:   6262,
+		Auth: func(username, password string) bool {
+			return true
+		},
+		MaxBytes: 1024 * 1024, //1MB
+	}
+}
+
 //ReplicationService implements the necessary backend servers to facilitate replication
 type ReplicationService struct {
 	natsServer      *natsd.Server
@@ -424,13 +484,12 @@ type ReplicationService struct {
 }
 
 //StartReplicationService configures and runs the server instances that facilitate the replication
-func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth func(string, string) bool,
-	encryptionkey []byte, cert, key string, errLog *log.Logger) (*ReplicationService, error) {
+func StartReplicationService(config *ServiceConfig) (*ReplicationService, error) {
 	//setup logger
-	if errLog == nil {
-		errLog = log.New(log.Writer(), "", log.LstdFlags)
+	if config.ErrLog == nil {
+		config.ErrLog = log.New(log.Writer(), "", log.LstdFlags)
 	}
-	errLog.SetPrefix("server ")
+	config.ErrLog.SetPrefix("server ")
 
 	//get random bytes
 	buf := make([]byte, 128)
@@ -440,9 +499,9 @@ func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth
 
 	//define replication service
 	s := ReplicationService{
-		auth:          auth,
+		auth:          config.Auth,
 		internalToken: base64.StdEncoding.EncodeToString(buf),
-		errLog:        errLog,
+		errLog:        config.ErrLog,
 	}
 
 	//get default options
@@ -450,18 +509,18 @@ func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth
 	nopts := &natsd.Options{}
 
 	//setup server options
-	nopts.Port = natsPort
-	nopts.MaxPayload = (1024 * 1024 * 2) //2MB payload size
+	nopts.Port = config.NatsPort
+	nopts.MaxPayload = (1024 * 1024 * 2) //2MB
 	nopts.CustomClientAuthentication = &s
-	opts.ID = cluster
+	opts.ID = config.Cluster
 	opts.StoreType = stores.TypeFile
-	opts.FilestoreDir = logDir
+	opts.FilestoreDir = config.LogDir
 	opts.FileStoreOpts.DoSync = true
-	opts.MaxBytes = maxBytes
+	opts.MaxBytes = config.MaxBytes
 
 	//setup file server options
 	s.fileServer = &http.Server{
-		Addr: fmt.Sprintf(":%d", fsPort),
+		Addr: fmt.Sprintf(":%d", config.FsPort),
 		Handler: s.authHandler(func(res http.ResponseWriter, req *http.Request) {
 			//get boudary
 			_contentType := strings.SplitN(req.Header.Get("Content-Type"), "=", 2)
@@ -508,7 +567,7 @@ func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth
 			}
 
 			//open source file
-			in, err := os.Open(filepath.Join(fsDir, req.URL.Path))
+			in, err := os.Open(filepath.Join(config.FsDir, req.URL.Path))
 			if err != nil {
 				http.Error(res, "error opening source file", http.StatusInternalServerError)
 				return
@@ -541,27 +600,27 @@ func StartReplicationService(cluster, logDir, fsDir string, maxBytes int64, auth
 	}
 
 	//determine if we should enable storage encryption
-	if encryptionkey != nil {
+	if config.LogEncryptionKey != nil {
 		opts.Encrypt = true
 		opts.EncryptionCipher = "AES"
-		opts.EncryptionKey = encryptionkey
+		opts.EncryptionKey = config.LogEncryptionKey
 	}
 
 	//determine if we should enable TLS
-	if cert != "" && key != "" {
+	if config.Certificate != "" && config.Key != "" {
 		//nats server TLS
 		nopts.TLS = true
-		nopts.TLSCert = cert
-		nopts.TLSKey = key
+		nopts.TLSCert = config.Certificate
+		nopts.TLSKey = config.Key
 
 		//start file server
 		go func() {
-			errLog.Panicln(s.fileServer.ListenAndServeTLS(cert, key))
+			s.errLog.Panicln(s.fileServer.ListenAndServeTLS(config.Certificate, config.Key))
 		}()
 	} else {
 		//start file server
 		go func() {
-			errLog.Panicln(s.fileServer.ListenAndServe())
+			s.errLog.Panicln(s.fileServer.ListenAndServe())
 		}()
 	}
 
