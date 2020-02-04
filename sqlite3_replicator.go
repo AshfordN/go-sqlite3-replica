@@ -689,10 +689,10 @@ func (s *ReplicationService) Check(c natsd.ClientAuthentication) bool {
 }
 
 //Shutdown shuts down the active server
-func (s *ReplicationService) Shutdown() error {
-	s.natsServer.Shutdown()
+func (s *ReplicationService) Shutdown(ctx context.Context) error {
 	s.streamingServer.Shutdown()
-	return s.fileServer.Close()
+	s.natsServer.Shutdown()
+	return s.fileServer.Shutdown(ctx)
 }
 
 func init() {
